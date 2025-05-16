@@ -8,14 +8,21 @@
 #include <string.h>
 #include <netinet/udp.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 
 #include "liburing.h"
 
-#define QD 64
-#define BUF_SHIFT 12 /* 4k */
+#define QD 128
+#define BUF_SHIFT 14 /* 4k */
 #define CQES (QD * 16)
 #define BUFFERS CQES
 #define CONTROLLEN 0
+
+#define DISCOVERY_PORT 0xDFCC
+#define PACKETGEN_PORT 0xDFCD
+#define DISCOVERY_ADDR "127.0.0.1" // or "192.168.4.32" if testing remotely
+#define PACKETGEN_ADDR "127.0.0.1" // or "192.168.4.32" if testing remotely
 
 struct sendmsg_ctx {
 	struct msghdr msg;
@@ -225,7 +232,7 @@ static int process_cqe_send(struct ctx *ctx, struct io_uring_cqe *cqe)
 }
 
 static int process_cqe_recv(struct ctx *ctx, struct io_uring_cqe *cqe,
-			    int fdidx)
+			    int fdidx, long* packets, long* totalb, long* lost, long long* prevn)
 {
 	int ret, idx;
 	struct io_uring_recvmsg_out *o;
@@ -307,6 +314,26 @@ static int process_cqe_recv(struct ctx *ctx, struct io_uring_cqe *cqe,
 		.msg_iov = &ctx->send[idx].iov,
 		.msg_iovlen = 1
 	};
+	
+	unsigned long long seqno;
+	unsigned int magic;
+	char* data = (char*)io_uring_recvmsg_payload(o, &ctx->msg);
+	memcpy(&seqno, data + 16, sizeof(seqno));
+	memcpy(&magic, data, sizeof(magic));
+	// printf("Received packet with magic number: %u\n", magic);
+	int size = io_uring_recvmsg_payload_length(o, cqe->res, &ctx->msg);
+	// if(size != 1056) {
+	// 	fprintf(stderr, "Received packet with unexpected size: %d\n", size);
+	// }
+	// printf("Received packet with sequence number: %llu\n", seqno);
+	if ((*prevn > 1) && (*prevn + 1 != seqno)) {
+		// printf("LOST %lld -> %lld (%lld)", *prevn, seqno, seqno - *prevn);
+		*lost += seqno - *prevn - 1;
+	}
+
+	*totalb += size;
+	*packets += 1;
+	*prevn = seqno;
 
 	io_uring_prep_sendmsg(sqe, fdidx, &ctx->send[idx].msg, 0);
 	io_uring_sqe_set_data64(sqe, idx);
@@ -314,12 +341,103 @@ static int process_cqe_recv(struct ctx *ctx, struct io_uring_cqe *cqe,
 
 	return 0;
 }
-static int process_cqe(struct ctx *ctx, struct io_uring_cqe *cqe, int fdidx)
+static int process_cqe(struct ctx *ctx, struct io_uring_cqe *cqe, int fdidx, long* packets, long* totalb, long* lost, long long* prevn)
 {
 	if (cqe->user_data < BUFFERS)
 		return process_cqe_send(ctx, cqe);
 	else
-		return process_cqe_recv(ctx, cqe, fdidx);
+		return process_cqe_recv(ctx, cqe, fdidx, packets, totalb, lost, prevn);
+}
+
+static void init_packetgen(int client_socket)
+{
+	#define ADDR_DISCOVERY "192.168.4.32"
+	#define PORT_DISCOVERY 0xDFCC
+	#define ADDR_PACKETGEN "192.168.4.32"
+	#define PORT_PACKETGEN 0xDFCD
+	#define BUFSIZE 16384 // 16 * 1024
+	#define MEGA 1000000
+    struct sockaddr_in addr_discovery, addr_packetgen;
+    socklen_t addr_len = sizeof(struct sockaddr_in);
+    char buffer[BUFSIZE];
+
+    // Configure discovery address
+    memset(&addr_discovery, 0, sizeof(addr_discovery));
+    addr_discovery.sin_family = AF_INET;
+    addr_discovery.sin_port = htons(PORT_DISCOVERY);
+    if (inet_pton(AF_INET, ADDR_DISCOVERY, &addr_discovery.sin_addr) <= 0) {
+        perror("inet_pton failed for discovery address");
+        close(client_socket);
+        exit(EXIT_FAILURE);
+    }
+
+    // Configure packetgen address
+    memset(&addr_packetgen, 0, sizeof(addr_packetgen));
+    addr_packetgen.sin_family = AF_INET;
+    addr_packetgen.sin_port = htons(PORT_PACKETGEN);
+    if (inet_pton(AF_INET, ADDR_PACKETGEN, &addr_packetgen.sin_addr) <= 0) {
+        perror("inet_pton failed for packetgen address");
+        close(client_socket);
+        exit(EXIT_FAILURE);
+    }
+
+    // Send discovery packet
+    sendto(client_socket, "\x00", 1, 0, (struct sockaddr *)&addr_discovery, sizeof(addr_discovery));
+
+    // Receive function (inline)
+    ssize_t recv_data(int socket, char *buffer, size_t bufsize, struct sockaddr_in *server_addr, socklen_t *addrlen) {
+        ssize_t recv_len = recvfrom(socket, buffer, bufsize, 0, (struct sockaddr *)server_addr, addrlen);
+        if (recv_len < 0) {
+            perror("recvfrom failed");
+            close(socket);
+            exit(0);
+        }
+        return recv_len;
+    }
+
+    // Initial receive
+    recv_data(client_socket, buffer, BUFSIZE, (struct sockaddr_in *)&addr_discovery, &addr_len);
+
+    // Send packet generation start command
+    char packetgen_start[] = "\x02\xFC\xCD\xDF\x00\x3F\x01\x00";
+	printf("Sending packetgen start command...\n");
+    sendto(client_socket, packetgen_start, 8, 0, (struct sockaddr *)&addr_packetgen, sizeof(addr_packetgen));
+	
+}
+
+static void stop_packetgen(int client_socket)
+{
+	#define ADDR_DISCOVERY "192.168.4.32"
+	#define PORT_DISCOVERY 0xDFCC
+	#define ADDR_PACKETGEN "192.168.4.32"
+	#define PORT_PACKETGEN 0xDFCD
+	#define BUFSIZE 16384 // 16 * 1024
+	#define MEGA 1000000
+    struct sockaddr_in addr_discovery, addr_packetgen;
+    socklen_t addr_len = sizeof(struct sockaddr_in);
+
+    // Configure discovery address
+    memset(&addr_discovery, 0, sizeof(addr_discovery));
+    addr_discovery.sin_family = AF_INET;
+    addr_discovery.sin_port = htons(PORT_DISCOVERY);
+    if (inet_pton(AF_INET, ADDR_DISCOVERY, &addr_discovery.sin_addr) <= 0) {
+        perror("inet_pton failed for discovery address");
+        close(client_socket);
+        exit(EXIT_FAILURE);
+    }
+
+    // Configure packetgen address
+    memset(&addr_packetgen, 0, sizeof(addr_packetgen));
+    addr_packetgen.sin_family = AF_INET;
+    addr_packetgen.sin_port = htons(PORT_PACKETGEN);
+    if (inet_pton(AF_INET, ADDR_PACKETGEN, &addr_packetgen.sin_addr) <= 0) {
+        perror("inet_pton failed for packetgen address");
+        close(client_socket);
+        exit(EXIT_FAILURE);
+    }
+	// Send packet generation stop command
+	char packetgen_stop[] = "\x02\xFC\xCD\xDF\x01\x01\x00\x00";
+	sendto(client_socket, packetgen_stop, 8, 0, (struct sockaddr *)&addr_packetgen, sizeof(addr_packetgen));
 }
 
 int main(int argc, char *argv[])
@@ -337,7 +455,7 @@ int main(int argc, char *argv[])
 	ctx.af = AF_INET;
 	ctx.buf_shift = BUF_SHIFT;
 
-	while ((opt = getopt(argc, argv, "6vp:b:")) != -1) {
+	while ((opt = getopt(argc, argv, "6vp:b:e")) != -1) { // Added 'e' option
 		switch (opt) {
 		case '6':
 			ctx.af = AF_INET6;
@@ -351,10 +469,10 @@ int main(int argc, char *argv[])
 		case 'v':
 			ctx.verbose = true;
 			break;
+		case 'e': // Emulate packetgen
+			break;;
 		default:
-			fprintf(stderr, "Usage: %s [-p port] "
-					"[-b log2(BufferSize)] [-6] [-v]\n",
-					argv[0]);
+			fprintf(stderr, "Usage: %s [-p port] [-b log2(BufferSize)] [-6] [-v] [-e]\n", argv[0]);
 			exit(-1);
 		}
 	}
@@ -377,7 +495,17 @@ int main(int argc, char *argv[])
 	ret = add_recv(&ctx, 0);
 	if (ret)
 		return 1;
+	
 
+
+
+	long packets = 0;
+	struct timeval start_tv;
+    gettimeofday(&start_tv, NULL);
+	long totalb = 0;
+	long lost = 0;
+	long long prevn = -1;
+	init_packetgen(sockfd);
 	while (true) {
 		ret = io_uring_submit_and_wait(&ctx.ring, 1);
 		if (ret == -EINTR)
@@ -388,15 +516,24 @@ int main(int argc, char *argv[])
 		}
 
 		count = io_uring_peek_batch_cqe(&ctx.ring, &cqes[0], CQES);
+		// printf("Received %ld packets\n", count);
 		for (i = 0; i < count; i++) {
-			ret = process_cqe(&ctx, cqes[i], 0);
-			if (ret)
+			ret = process_cqe(&ctx, cqes[i], 0, &packets, &totalb, &lost, &prevn);
+			if (ret || packets >= 1000000)
+			{
+				struct timeval end_tv;
+				gettimeofday(&end_tv, NULL);
+				double delta = (end_tv.tv_sec - start_tv.tv_sec) + (end_tv.tv_usec - start_tv.tv_usec) / 1000000.0;
+				printf("Received %ld packets, %ld packets lost, %ld bytes (%.1f MB) in %.1f s (%.1f MB/s)\n",
+					packets, lost, totalb, (double)totalb / MEGA, delta, (double)totalb / MEGA / delta);
 				goto cleanup;
+			}
 		}
 		io_uring_cq_advance(&ctx.ring, count);
 	}
 
 cleanup:
+	stop_packetgen(sockfd);
 	cleanup_context(&ctx);
 	close(sockfd);
 	return ret;
